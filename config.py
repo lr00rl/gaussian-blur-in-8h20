@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     
     # 处理参数
     max_batch_size: int = 32
-    gaussian_sigma: float = 4.0
+    gaussian_sigma: float = 18.0
     gaussian_ksize: int = 21  # 必须是奇数，且 <= 31
     jpeg_quality: int = 75
     

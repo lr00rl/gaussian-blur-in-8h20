@@ -8,7 +8,8 @@ with open('../gaussian-blur/0000220505603.jpg', 'rb') as f:
     print(f"Magic number: {img_data[:4].hex()}")
 
 files = [
-    ('files', ('test.jpg', img_data, 'image/jpeg'))
+    ('files', ('test.jpg', img_data, 'image/jpeg')),
+    ('files', ('100.jpg', img_data, 'image/jpeg'))
 ]
 
 response = requests.post(

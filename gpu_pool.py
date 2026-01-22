@@ -1,4 +1,12 @@
 import multiprocessing as mp
+
+# ✅ 强制使用spawn模式 - 避免fork导致的CUDA context冲突
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    # 如果已经设置过，忽略
+    pass
+
 import threading
 from typing import List, Dict
 import time
@@ -8,14 +16,21 @@ from config import settings
 class GPUWorkerProcess:
     @staticmethod
     def worker_loop(gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue):
+        """
+        Worker进程主循环
+        
+        ✅ 关键：在spawn模式下，这个函数在全新的进程中运行
+        不会继承主进程的任何CUDA状态
+        """
         try:
+            # 在新进程中初始化GPU资源
             processor = BatchGaussianProcessor(
                 gpu_id=gpu_id,
                 sigma=settings.gaussian_sigma,
                 ksize=settings.gaussian_ksize,
                 num_streams=settings.num_streams_per_gpu
             )
-            print(f"[GPU {gpu_id}] Worker started")
+            print(f"[GPU {gpu_id}] Worker started (PID: {mp.current_process().pid})")
         except Exception as e:
             print(f"[GPU {gpu_id}] Init failed: {e}")
             result_queue.put((-1, None, f"GPU {gpu_id} init failed: {e}"))
@@ -51,8 +66,11 @@ class BatchGPUPool:
         self.gpu_ids = settings.gpu_ids[:self.num_gpus]
         
         queue_size = self.num_gpus * settings.queue_size_multiplier
-        self.task_queue = mp.Queue(maxsize=queue_size)
-        self.result_queue = mp.Queue()
+        
+        # ✅ 使用multiprocessing.Manager创建Queue，兼容spawn模式
+        manager = mp.Manager()
+        self.task_queue = manager.Queue(maxsize=queue_size)
+        self.result_queue = manager.Queue()
         
         self.pending_requests: Dict[int, 'asyncio.Future'] = {}
         self.request_counter = 0
@@ -73,7 +91,7 @@ class BatchGPUPool:
         self.collector_thread = threading.Thread(target=self._collect_results, daemon=True)
         self.collector_thread.start()
         
-        print(f"[GPUPool] Initialized with {self.num_gpus} GPUs")
+        print(f"[GPUPool] Initialized with {self.num_gpus} GPUs (spawn mode)")
     
     def _collect_results(self):
         while True:
