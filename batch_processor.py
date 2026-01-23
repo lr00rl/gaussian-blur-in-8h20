@@ -6,75 +6,117 @@ from cupyx.scipy.ndimage import gaussian_filter
 import time
 
 class BatchGaussianProcessor:
-    """使用CuPy实现GPU高斯模糊 - 稳定可靠"""
-
-    def __init__(self, gpu_id: int, sigma: float = 4.0, ksize: int = 21, num_streams: int = 4):
+    def __init__(self, gpu_id: int, sigma: float = 4.0):
         self.gpu_id = gpu_id
         self.sigma = sigma
-        self.ksize = ksize  # 保留但不使用（CuPy的gaussian_filter只需要sigma）
-        
-        # 设置CuPy使用的GPU
+
         with cp.cuda.Device(gpu_id):
-            # 预热GPU
-            dummy = cp.zeros((100, 100, 3), dtype=cp.uint8)
-            _ = gaussian_filter(dummy[:, :, 0].astype(cp.float32), sigma=sigma)
-        
-        print(f"[GPU {gpu_id}] Worker initialized (CuPy): sigma={sigma:.2f}, PID={cp.cuda.runtime.getDevice()}")
+            # 预编译kernel,避免首次调用开销
+            dummy = cp.zeros((2, 100, 100, 3), dtype=cp.float32)
+            _ = self._batch_gaussian_filter(dummy)
+
+    def _batch_gaussian_filter(self, batch_tensor: cp.ndarray) -> cp.ndarray:
+        """
+        批量高斯模糊 - 关键优化点
+
+        输入: (N, H, W, 3) - N张图片
+        输出: (N, H, W, 3)
+        """
+        N = batch_tensor.shape[0]
+
+        # 将通道移到第一维: (N, H, W, 3) -> (N, 3, H, W)
+        # 这样可以对所有图片的同一通道批量处理
+        batch_tensor = cp.transpose(batch_tensor, (0, 3, 1, 2))
+
+        # 批量处理: 对每个通道并行应用filter
+        results = []
+        for c in range(3):
+            channel_batch = batch_tensor[:, c, :, :]  # (N, H, W)
+
+            # 对N张图片的同一通道同时模糊
+            blurred_batch = cp.stack([
+                gaussian_filter(channel_batch[i], sigma=self.sigma, mode='reflect')
+                for i in range(N)
+            ])
+            results.append(blurred_batch)
+
+        # 合并通道: (3, N, H, W) -> (N, 3, H, W) -> (N, H, W, 3)
+        output = cp.stack(results, axis=1)  # (N, 3, H, W)
+        output = cp.transpose(output, (0, 2, 3, 1))  # (N, H, W, 3)
+
+        return output
 
     def process_batch(self, images_bytes: List[bytes], quality: int = 75) -> List[bytes]:
-        """批量处理"""
-        batch_size = len(images_bytes)
-        start_time = time.perf_counter()
-        
-        results = []
-        for idx, img_bytes in enumerate(images_bytes):
-            try:
-                result = self._process_single(img_bytes, quality)
-                results.append(result)
-            except Exception as e:
-                print(f"[GPU {self.gpu_id}][Img {idx}] Error: {e}")
-                raise
-        
-        elapsed = (time.perf_counter() - start_time) * 1000
-        print(f"[GPU {self.gpu_id}] ✅ Processed {batch_size} images in {elapsed:.2f}ms "
-              f"({batch_size/(elapsed/1000):.1f} img/s)")
-        
-        return results
-
-    def _process_single(self, img_bytes: bytes, quality: int) -> bytes:
-        """
-        单张处理流程：
-        CPU解码 → GPU传输 → GPU高斯模糊 → CPU传输 → CPU编码
-        """
-        # 设置当前GPU
+        """优化后的批处理"""
         with cp.cuda.Device(self.gpu_id):
-            # 1. CPU解码
-            img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError("Failed to decode image")
-            
-            # 2. 转移到GPU（异步传输）
-            gpu_img = cp.asarray(img)
-            
-            # 3. GPU高斯模糊（对每个通道并行处理）
-            # 转换为float32以获得更好的精度
-            gpu_img_float = gpu_img.astype(cp.float32)
-            
-            # 对BGR三个通道分别模糊
-            blurred_b = gaussian_filter(gpu_img_float[:, :, 0], sigma=self.sigma, mode='reflect')
-            blurred_g = gaussian_filter(gpu_img_float[:, :, 1], sigma=self.sigma, mode='reflect')
-            blurred_r = gaussian_filter(gpu_img_float[:, :, 2], sigma=self.sigma, mode='reflect')
-            
-            # 合并通道并转回uint8
-            gpu_blurred = cp.stack([blurred_b, blurred_g, blurred_r], axis=2)
+            start = time.perf_counter()
+
+            # === 阶段1: CPU并行解码 ===
+            # 使用ThreadPoolExecutor并行解码JPEG
+            from concurrent.futures import ThreadPoolExecutor
+
+            def decode_jpeg(img_bytes):
+                img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError("Decode failed")
+                return img
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                cpu_images = list(executor.map(decode_jpeg, images_bytes))
+
+            decode_time = (time.perf_counter() - start) * 1000
+
+            # === 阶段2: 统一尺寸 (padding到最大尺寸) ===
+            # 找到最大尺寸
+            max_h = max(img.shape[0] for img in cpu_images)
+            max_w = max(img.shape[1] for img in cpu_images)
+
+            # Padding到统一尺寸 (batch要求shape一致)
+            padded_images = []
+            padding_info = []
+
+            for img in cpu_images:
+                h, w = img.shape[:2]
+                padded = np.zeros((max_h, max_w, 3), dtype=np.uint8)
+                padded[:h, :w] = img
+                padded_images.append(padded)
+                padding_info.append((h, w))
+
+            # === 阶段3: 批量GPU传输 ===
+            gpu_batch = cp.asarray(np.stack(padded_images))  # (N, H, W, 3)
+            upload_time = (time.perf_counter() - start - decode_time/1000) * 1000
+
+            # === 阶段4: 批量GPU计算 ===
+            gpu_batch_float = gpu_batch.astype(cp.float32)
+            gpu_blurred = self._batch_gaussian_filter(gpu_batch_float)
             gpu_blurred = cp.clip(gpu_blurred, 0, 255).astype(cp.uint8)
-            
-            # 4. 转回CPU
-            cpu_blurred = cp.asnumpy(gpu_blurred)
-            
-            # 5. CPU编码
-            success, jpeg = cv2.imencode('.jpg', cpu_blurred, [cv2.IMWRITE_JPEG_QUALITY, quality])
-            if not success:
-                raise RuntimeError("Failed to encode JPEG")
-            
-            return jpeg.tobytes()
+
+            compute_time = (time.perf_counter() - start - decode_time/1000 - upload_time/1000) * 1000
+
+            # === 阶段5: 批量GPU传输回CPU ===
+            cpu_batch = cp.asnumpy(gpu_blurred)
+            download_time = (time.perf_counter() - start - decode_time/1000 - upload_time/1000 - compute_time/1000) * 1000
+
+            # === 阶段6: CPU并行编码 ===
+            def encode_jpeg(args):
+                idx, img = args
+                h, w = padding_info[idx]
+                cropped = img[:h, :w]  # 去除padding
+                success, jpeg = cv2.imencode('.jpg', cropped, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                if not success:
+                    raise RuntimeError("Encode failed")
+                return jpeg.tobytes()
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(encode_jpeg, enumerate(cpu_batch)))
+
+            total_time = (time.perf_counter() - start) * 1000
+            encode_time = total_time - decode_time - upload_time - compute_time - download_time
+
+            print(f"[GPU {self.gpu_id}] Batch {len(images_bytes)} imgs: "
+                  f"decode={decode_time:.1f}ms, upload={upload_time:.1f}ms, "
+                  f"compute={compute_time:.1f}ms, download={download_time:.1f}ms, "
+                  f"encode={encode_time:.1f}ms, total={total_time:.1f}ms "
+                  f"({len(images_bytes)/(total_time/1000):.1f} img/s)")
+
+            return results
