@@ -67,10 +67,12 @@ class BatchGPUPool:
         
         queue_size = self.num_gpus * settings.queue_size_multiplier
         
-        # ✅ 使用multiprocessing.Manager创建Queue，兼容spawn模式
-        manager = mp.Manager()
-        self.task_queue = manager.Queue(maxsize=queue_size)
-        self.result_queue = manager.Queue()
+        # 使用 mp.Queue（pipe + per-side feeder thread）替代 manager.Queue（单 Manager 进程 + TCP）
+        # 原因：manager.Queue 所有 put/get 都串行经过单一 Manager 进程做 pickle，
+        # 16 worker 抢同一服务时极易瓶颈（实测 worker CPU 从 19% 掉到 3%）。
+        # mp.Queue 走 pipe，每对 producer/consumer 独立，无中央瓶颈，spawn 兼容。
+        self.task_queue = mp.Queue(maxsize=queue_size)
+        self.result_queue = mp.Queue()
         
         self.pending_requests: Dict[int, 'asyncio.Future'] = {}
         self.request_counter = 0
